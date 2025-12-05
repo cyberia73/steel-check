@@ -23,12 +23,15 @@ MENTIONS_SHEET_NAME = os.getenv("MENTIONS_SHEET_NAME", "호출대상자")
 
 _raw_alert_ids = os.getenv("ALERT_CHANNEL_ID", "")
 
-# ALERT_CHANNEL_ID는 "채널ID1,채널ID2,..." 형식
-ALERT_CHANNEL_IDS = [
-    int(cid.strip())
-    for cid in _raw_alert_ids.split(",")
-    if cid.strip().isdigit()
-]
+# ALERT_CHANNEL_ID는 "채널ID1,채널ID2,..." 형식 (여러 채널 지원)
+if _raw_alert_ids:
+    ALERT_CHANNEL_IDS = []
+    for cid in _raw_alert_ids.split(","):
+        cid = cid.strip()
+        if cid.isdigit():
+            ALERT_CHANNEL_IDS.append(int(cid))
+else:
+    ALERT_CHANNEL_IDS = []
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN 환경변수가 설정되어 있지 않습니다.")
@@ -87,18 +90,28 @@ def parse_datetime(dt_str: str) -> datetime | None:
 
 
 def find_row(keyword: str) -> int | None:
-    """A열에서 keyword와 일치하는 행 번호를 찾음."""
-    col = timer_sheet.col_values(1)
-    for idx, value in enumerate(col, start=1):
-        if value == keyword:
-            return idx
+    """
+    시트 전체에서 keyword(예: '강철1')와 일치하는 셀을 찾고,
+    그 셀이 속한 행 번호를 반환한다.
+
+    - '강철1', '강철 1' 모두 허용 (공백 무시)
+    - 어느 열에 있어도 상관 없음
+    """
+    data = timer_sheet.get_all_values()
+    target = keyword.replace(" ", "")
+
+    for row_idx, row in enumerate(data, start=1):
+        for cell in row:
+            val = (cell or "").replace(" ", "")
+            if val == target:
+                return row_idx
     return None
 
 
 def get_timer_data(row: int):
     """
     해당 행의 타이머 정보를 반환.
-    (start_dt, duration_sec, status, alert_stage)
+    (name, start_dt, duration_sec, status, alert_stage)
     타이머가 없으면 None
     """
     values = timer_sheet.row_values(row)
@@ -155,7 +168,7 @@ def get_steel_mentions() -> list[int]:
     ids: list[int] = []
     # B열부터 끝까지
     for val in row_values[1:]:
-        val = val.strip()
+        val = (val or "").strip()
         if not val:
             continue
         if val.isdigit():
@@ -291,36 +304,56 @@ async def timer_checker():
 async def 강철(ctx: commands.Context, number: str):
     """
     !강철 X
-    - 이미 타이머가 돌고 있으면 남은 시간 표시
-    - 없으면 새 12시간 타이머 시작
+    - 시트에 '강철X'가 없으면: 새 행 생성 후 12시간 타이머 시작
+    - 시트에 이미 있으면:
+        * RUNNING이면 남은 시간 표시
+        * 그 외면 새 12시간 타이머 다시 시작
     """
     key = f"강철{number}"
+
+    # 1) 먼저 기존 행을 찾는다
     row = find_row(key)
 
+    # 2) 없으면 시트 맨 아래에 새 행 만들고 타이머 시작
     if not row:
-        await ctx.send("시트에서 해당 강철 번호를 찾을 수 없습니다.")
+        data = timer_sheet.get_all_values()
+        row = len(data) + 1  # 맨 마지막 다음 줄
+
+        # A열에 이름만 먼저 써 둔다
+        timer_sheet.update_cell(row, 1, key)
+
+        # 새 타이머 시작
+        set_timer(row, duration_sec=12 * 60 * 60)
+        await ctx.send(f"⏳ **{key} 타이머가 시트에 새로 생성되고, 12시간 타이머를 시작했습니다.**")
         return
 
+    # 3) 기존 행이 있는 경우: 그 행의 타이머 상태를 본다
     timer = get_timer_data(row)
 
-    # 이미 타이머가 있는 경우: 남은 시간 안내
-    if timer:
-        name, start_dt, duration, status, alert_stage = timer
-        if status == "RUNNING":
-            end_time = start_dt + timedelta(seconds=duration)
-            left = end_time - datetime.utcnow()
-            sec = int(left.total_seconds())
-            if sec <= 0:
-                await ctx.send(f"🔔 {key} 타이머는 이미 종료되었습니다.")
-                return
-            h, m = divmod(sec // 60, 60)
-            s = sec % 60
-            await ctx.send(f"🕒 **{key} 남은 시간:** {h}시간 {m}분 {s}초")
-            return
+    # 타이머 정보가 없거나(이전에 깨끗이 비워진 상태), RUNNING이 아니면 새로 시작
+    if not timer:
+        set_timer(row, duration_sec=12 * 60 * 60)
+        await ctx.send(f"⏳ **{key} 타이머를 새로 시작했습니다! (12시간)**")
+        return
 
-    # 새 타이머 시작
-    set_timer(row, duration_sec=12 * 60 * 60)
-    await ctx.send(f"⏳ **{key} 타이머를 새로 시작했습니다! (12시간)**")
+    name, start_dt, duration, status, alert_stage = timer
+
+    if status == "RUNNING":
+        # 남은 시간 계산
+        end_time = start_dt + timedelta(seconds=duration)
+        left = end_time - datetime.utcnow()
+        sec = int(left.total_seconds())
+        if sec <= 0:
+            await ctx.send(f"🔔 {key} 타이머는 이미 종료되었습니다.")
+            return
+        h, m = divmod(sec // 60, 60)
+        s = sec % 60
+        await ctx.send(f"🕒 **{key} 남은 시간:** {h}시간 {m}분 {s}초")
+        return
+    else:
+        # RUNNING이 아니면(예: DONE) 새 타이머 다시 시작
+        set_timer(row, duration_sec=12 * 60 * 60)
+        await ctx.send(f"⏳ **{key} 타이머를 다시 시작했습니다! (12시간)**")
 
 
 @bot.command(name="완료")
@@ -369,7 +402,7 @@ async def 강철대상(ctx: commands.Context):
     while len(row_vals) < 2:
         row_vals.append("")
 
-    existing_ids = set(v.strip() for v in row_vals[1:] if v.strip())
+    existing_ids = set((v or "").strip() for v in row_vals[1:] if (v or "").strip())
 
     added = []
     for member in ctx.message.mentions:
@@ -379,7 +412,7 @@ async def 강철대상(ctx: commands.Context):
             # row_vals[0] = A2, row_vals[1] = B2 ...
             try:
                 first_empty_idx = next(
-                    i for i, v in enumerate(row_vals[1:], start=2) if not v.strip()
+                    i for i, v in enumerate(row_vals[1:], start=2) if not (v or "").strip()
                 )
             except StopIteration:
                 # 빈 칸이 없으면 맨 끝 다음 칸에 추가
