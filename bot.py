@@ -15,8 +15,20 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME")
-MENTIONS_SHEET_NAME = os.getenv("MENTIONS_SHEET_NAME")  # 호출대상자 시트명
-ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID"))
+MENTIONS_SHEET_NAME = os.getenv("MENTIONS_SHEET_NAME")
+
+# ALERT_CHANNEL_ID 안전 처리 + 디버그 출력
+_raw_alert_id = os.getenv("ALERT_CHANNEL_ID")
+if not _raw_alert_id:
+    print("WARNING: ALERT_CHANNEL_ID 환경변수가 설정되어 있지 않습니다.")
+    ALERT_CHANNEL_ID = None
+else:
+    try:
+        ALERT_CHANNEL_ID = int(_raw_alert_id)
+    except ValueError:
+        print(f"WARNING: ALERT_CHANNEL_ID 값이 잘못되었습니다: {_raw_alert_id!r}")
+        ALERT_CHANNEL_ID = None
+
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 # 12시간(초)
@@ -212,18 +224,22 @@ async def remove_steel_target(ctx, *members):
 
 
 # --------------------------------
-# 타이머 체크 루프
+# 타이머 체크 루프 (150초마다 1번)
 # --------------------------------
 
-@tasks.loop(seconds=120)  # 프로 환경이면 10~30초 정도 추천
+@tasks.loop(seconds=150)
 async def timer_check():
     """
-    모든 강철 타이머를 주기적으로 체크해서
+    모든 강철 타이머를 150초(2.5분)마다 체크해서
     4시간 / 2시간 / 1시간 / 30분 / 종료 알람을 보냄.
     """
+    if ALERT_CHANNEL_ID is None:
+        print("ERROR: ALERT_CHANNEL_ID가 설정되어 있지 않아 알림 채널을 찾을 수 없습니다.")
+        return
+
     channel = bot.get_channel(ALERT_CHANNEL_ID)
     if channel is None:
-        print("ERROR: Alert channel not found.")
+        print(f"ERROR: Alert channel (ID={ALERT_CHANNEL_ID}) not found.")
         return
 
     try:
