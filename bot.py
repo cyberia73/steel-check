@@ -23,7 +23,7 @@ MENTIONS_SHEET_NAME = os.getenv("MENTIONS_SHEET_NAME", "호출대상자")
 
 _raw_alert_ids = os.getenv("ALERT_CHANNEL_ID", "")
 
-# ALERT_CHANNEL_ID는 "채널ID1,채널ID2,..." 형식 (여러 채널 지원)
+# ALERT_CHANNEL_ID 는 "채널ID1,채널ID2,..." 형식 (여러 개 지원)
 if _raw_alert_ids:
     ALERT_CHANNEL_IDS = []
     for cid in _raw_alert_ids.split(","):
@@ -243,7 +243,6 @@ async def timer_checker():
 
         # 이미 끝난 경우
         if left_sec <= 0:
-            # 종료 알림 (이미 DONE 처리된 것이라면 스킵)
             if status == "RUNNING":
                 mentions = format_mentions_for_steel()
                 msg = f"⏰ **{name} 타이머 종료!**{mentions}"
@@ -260,7 +259,7 @@ async def timer_checker():
             try:
                 return order.index(prev) < order.index(current)
             except ValueError:
-                # 이상한 값이면 그냥 통과시켜버림 (안전)
+                # 이상한 값이면 그냥 통과 (안전)
                 return True
 
         # 4시간 전
@@ -304,17 +303,24 @@ async def timer_checker():
 async def 강철(ctx: commands.Context, number: str):
     """
     !강철 X
-    - 시트에 '강철X'가 없으면: 새 행 생성 후 12시간 타이머 시작
-    - 시트에 이미 있으면:
-        * RUNNING이면 남은 시간 표시
-        * 그 외면 새 12시간 타이머 다시 시작
+
+    - 시트에 '강철X' 행이 없으면:
+        → 새 행을 만들고 12시간 타이머 시작
+
+    - 시트에 '강철X' 행이 있고,
+        * 상태가 RUNNING이면
+            → 남은 시간만 보여줌 (새로 안 만듦)
+        * 상태가 DONE 이면
+            → 기존 행 위에 새로 12시간 타이머 시작 (재사용)
+        * 그 외(비어 있거나 이상한 값)이면
+            → 새 12시간 타이머 시작
     """
     key = f"강철{number}"
 
     # 1) 먼저 기존 행을 찾는다
     row = find_row(key)
 
-    # 2) 없으면 시트 맨 아래에 새 행 만들고 타이머 시작
+    # 2) 아예 행이 없으면: 맨 아래에 새로 만들고 타이머 시작
     if not row:
         data = timer_sheet.get_all_values()
         row = len(data) + 1  # 맨 마지막 다음 줄
@@ -327,10 +333,10 @@ async def 강철(ctx: commands.Context, number: str):
         await ctx.send(f"⏳ **{key} 타이머가 시트에 새로 생성되고, 12시간 타이머를 시작했습니다.**")
         return
 
-    # 3) 기존 행이 있는 경우: 그 행의 타이머 상태를 본다
+    # 3) 행은 있는데, 거기에 저장된 타이머 정보 읽기
     timer = get_timer_data(row)
 
-    # 타이머 정보가 없거나(이전에 깨끗이 비워진 상태), RUNNING이 아니면 새로 시작
+    # 3-1) 정보가 아예 없거나(이상하게 비어있을 때)
     if not timer:
         set_timer(row, duration_sec=12 * 60 * 60)
         await ctx.send(f"⏳ **{key} 타이머를 새로 시작했습니다! (12시간)**")
@@ -338,8 +344,8 @@ async def 강철(ctx: commands.Context, number: str):
 
     name, start_dt, duration, status, alert_stage = timer
 
+    # 3-2) RUNNING이면: 기존 남은 시간만 보여주기 (새로 안 만듦)
     if status == "RUNNING":
-        # 남은 시간 계산
         end_time = start_dt + timedelta(seconds=duration)
         left = end_time - datetime.utcnow()
         sec = int(left.total_seconds())
@@ -350,10 +356,17 @@ async def 강철(ctx: commands.Context, number: str):
         s = sec % 60
         await ctx.send(f"🕒 **{key} 남은 시간:** {h}시간 {m}분 {s}초")
         return
-    else:
-        # RUNNING이 아니면(예: DONE) 새 타이머 다시 시작
+
+    # 3-3) DONE이거나, RUNNING이 아닌 다른 상태면: 새로 12시간 타이머 시작
+    #     (행은 새로 안 만들고, 기존 행 재사용)
+    if status == "DONE" or status == "":
         set_timer(row, duration_sec=12 * 60 * 60)
         await ctx.send(f"⏳ **{key} 타이머를 다시 시작했습니다! (12시간)**")
+        return
+
+    # 혹시 다른 상태 문자열이 있었을 때도 안전하게 처리
+    set_timer(row, duration_sec=12 * 60 * 60)
+    await ctx.send(f"⏳ **{key} 타이머 상태가 이상하여, 새로 12시간 타이머를 시작했습니다.**")
 
 
 @bot.command(name="완료")
