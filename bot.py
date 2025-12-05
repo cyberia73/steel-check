@@ -215,7 +215,7 @@ async def remove_steel_target(ctx, *members):
 # 타이머 체크 루프
 # --------------------------------
 
-@tasks.loop(seconds=10)  # 프로 환경이면 10~30초 정도 추천
+@tasks.loop(seconds=120)  # 프로 환경이면 10~30초 정도 추천
 async def timer_check():
     """
     모든 강철 타이머를 주기적으로 체크해서
