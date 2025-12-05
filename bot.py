@@ -1,318 +1,441 @@
+# bot.py
+import os
+import json
+from datetime import datetime, timedelta
+
 import discord
 from discord.ext import commands, tasks
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import json
-import os
 from dotenv import load_dotenv
 
-# --------------------------------
-# .env 로드
-# --------------------------------
+# =========================
+#      환경변수 로드
+# =========================
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME")
-MENTIONS_SHEET_NAME = os.getenv("MENTIONS_SHEET_NAME")
+MENTIONS_SHEET_NAME = os.getenv("MENTIONS_SHEET_NAME", "호출대상자")
 
-# ALERT_CHANNEL_ID 안전 처리 + 디버그 출력
-_raw_alert_id = os.getenv("ALERT_CHANNEL_ID")
-if not _raw_alert_id:
-    print("WARNING: ALERT_CHANNEL_ID 환경변수가 설정되어 있지 않습니다.")
-    ALERT_CHANNEL_ID = None
-else:
-    try:
-        ALERT_CHANNEL_ID = int(_raw_alert_id)
-    except ValueError:
-        print(f"WARNING: ALERT_CHANNEL_ID 값이 잘못되었습니다: {_raw_alert_id!r}")
-        ALERT_CHANNEL_ID = None
+_raw_alert_ids = os.getenv("ALERT_CHANNEL_ID", "")
 
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
-# 12시간(초)
-DURATION_SECONDS = 12 * 3600
-
-# --------------------------------
-# 구글 인증
-# --------------------------------
-creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-
-scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+# ALERT_CHANNEL_ID는 "채널ID1,채널ID2,..." 형식
+ALERT_CHANNEL_IDS = [
+    int(cid.strip())
+    for cid in _raw_alert_ids.split(",")
+    if cid.strip().isdigit()
 ]
 
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN 환경변수가 설정되어 있지 않습니다.")
+
+if not GOOGLE_CREDENTIALS_JSON:
+    raise ValueError("GOOGLE_CREDENTIALS_JSON 환경변수가 설정되어 있지 않습니다.")
+
+if not GOOGLE_SHEET_NAME or not GOOGLE_WORKSHEET_NAME:
+    raise ValueError("GOOGLE_SHEET_NAME 또는 GOOGLE_WORKSHEET_NAME 이 설정되어 있지 않습니다.")
+
+if not ALERT_CHANNEL_IDS:
+    print("WARNING: ALERT_CHANNEL_ID 환경변수가 비어있거나 잘못되었습니다. 알림 채널이 없습니다.")
+
+# =========================
+#      디스코드 설정
+# =========================
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# =========================
+#     구글 시트 인증
+# =========================
+creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gc = gspread.authorize(creds)
 
 sheet_file = gc.open(GOOGLE_SHEET_NAME)
-ws = sheet_file.worksheet(GOOGLE_WORKSHEET_NAME)
-mention_ws = sheet_file.worksheet(MENTIONS_SHEET_NAME)
+timer_sheet = sheet_file.worksheet(GOOGLE_WORKSHEET_NAME)
+mentions_sheet = sheet_file.worksheet(MENTIONS_SHEET_NAME)
 
-# --------------------------------
-# 디스코드 봇 설정
-# --------------------------------
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --------------------------------
-# 유틸 함수
-# --------------------------------
+# =========================
+#      유틸 함수들
+# =========================
 
-def find_row(material_name: str):
-    """이름(예: 강철1)에 해당하는 행 번호 찾기"""
+def parse_datetime(dt_str: str) -> datetime | None:
+    """시트에 저장된 날짜 문자열을 datetime으로 변환."""
+    if not dt_str:
+        return None
+    dt_str = dt_str.strip()
     try:
-        cell = ws.find(material_name)
-        return cell.row
+        # "YYYY-MM-DDTHH:MM:SS" 또는 "YYYY-MM-DD HH:MM:SS"
+        if "T" in dt_str:
+            return datetime.fromisoformat(dt_str)
+        else:
+            return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
 
 
-def get_steel_mentions():
-    """
-    호출대상자 시트 2행(B2~)에서 강철 알림 대상자 리스트 가져오기
-    A2 = "강철대상자"
-    B2~ = @유저 들
-    """
-    row = mention_ws.row_values(2)[1:]  # B2~
-    return [x for x in row if x]
+def find_row(keyword: str) -> int | None:
+    """A열에서 keyword와 일치하는 행 번호를 찾음."""
+    col = timer_sheet.col_values(1)
+    for idx, value in enumerate(col, start=1):
+        if value == keyword:
+            return idx
+    return None
 
 
-def parse_start_time(value: str):
+def get_timer_data(row: int):
     """
-    시트에 저장된 시간 문자열을 datetime으로 변환.
-    지원:
-      - 2025-12-05T07:35:09
-      - 2025-12-05 7:35:09 (공백 -> T로 변환해서 처리)
+    해당 행의 타이머 정보를 반환.
+    (start_dt, duration_sec, status, alert_stage)
+    타이머가 없으면 None
     """
-    if not value:
+    values = timer_sheet.row_values(row)
+    # 최소 5칸: 이름, 시작, 지속, 상태, 알람스테이지
+    while len(values) < 5:
+        values.append("")
+    name = values[0]
+    start_str = values[1]
+    duration_str = values[2]
+    status = values[3] or ""
+    alert_stage = values[4] or "NONE"
+
+    start_dt = parse_datetime(start_str)
+    if not start_dt:
         return None
+
     try:
-        return datetime.fromisoformat(value)
-    except ValueError:
+        duration = int(duration_str)
+    except Exception:
+        return None
+
+    return name, start_dt, duration, status, alert_stage
+
+
+def set_timer(row: int, duration_sec: int = 12 * 60 * 60):
+    """
+    새 타이머 시작: 현재 UTC 기준, duration_sec(기본 12시간)
+    """
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    timer_sheet.update_cell(row, 2, now)           # 시작 시간
+    timer_sheet.update_cell(row, 3, duration_sec)  # 지속(초)
+    timer_sheet.update_cell(row, 4, "RUNNING")     # 상태
+    timer_sheet.update_cell(row, 5, "NONE")        # 알람 스테이지
+
+
+def mark_timer_done(row: int):
+    """타이머를 종료 상태로 표시."""
+    timer_sheet.update_cell(row, 4, "DONE")
+    timer_sheet.update_cell(row, 5, "DONE")
+
+
+def update_alert_stage(row: int, stage: str):
+    """알람 스테이지 업데이트 (NONE, 4H, 2H, 1H, 30M, DONE 등)."""
+    timer_sheet.update_cell(row, 5, stage)
+
+
+def get_steel_mentions() -> list[int]:
+    """
+    호출대상자 시트에서 '강철대상자' 행의 대상자 ID들을 읽어옴.
+    A2: "강철대상자"
+    B2 ~ : 디스코드 user_id 문자열
+    """
+    row_values = mentions_sheet.row_values(2)  # 2행 전체
+    ids: list[int] = []
+    # B열부터 끝까지
+    for val in row_values[1:]:
+        val = val.strip()
+        if not val:
+            continue
+        if val.isdigit():
+            ids.append(int(val))
+    return ids
+
+
+async def broadcast_alert(message: str):
+    """
+    ALERT_CHANNEL_IDS에 설정된 모든 채널에 동일한 메시지 전송.
+    """
+    if not ALERT_CHANNEL_IDS:
+        print("ERROR: Alert channel list is empty.")
+        return
+
+    for cid in ALERT_CHANNEL_IDS:
+        channel = bot.get_channel(cid)
+        if channel:
+            try:
+                await channel.send(message)
+            except Exception as e:
+                print(f"ERROR sending message to channel {cid}: {e}")
+
+
+def format_mentions_for_steel() -> str:
+    """
+    강철 대상자 멘션 문자열 생성: "<@id1> <@id2> ..."
+    대상자가 없으면 빈 문자열.
+    """
+    ids = get_steel_mentions()
+    if not ids:
+        return ""
+    return " " + " ".join(f"<@{uid}>" for uid in ids)
+
+
+# =========================
+#     타이머 백그라운드
+# =========================
+
+@tasks.loop(seconds=150)  # 150초마다 체크
+async def timer_checker():
+    now = datetime.utcnow()
+
+    # 시트 전체 읽기
+    data = timer_sheet.get_all_values()
+    # 1행은 헤더라고 가정, 2행부터 타이머 데이터
+    for row_idx, row in enumerate(data[1:], start=2):
+        # 최소 5칸 확보
+        while len(row) < 5:
+            row.append("")
+
+        name = row[0]
+        start_str = row[1]
+        duration_str = row[2]
+        status = row[3] or ""
+        alert_stage = row[4] or "NONE"
+
+        if status != "RUNNING":
+            continue
+
+        start_dt = parse_datetime(start_str)
+        if not start_dt:
+            continue
+
         try:
-            cleaned = value.replace(" ", "T")
-            return datetime.fromisoformat(cleaned)
+            duration = int(duration_str)
         except Exception:
-            return None
+            continue
+
+        end_time = start_dt + timedelta(seconds=duration)
+        left_sec = int((end_time - now).total_seconds())
+
+        # 이미 끝난 경우
+        if left_sec <= 0:
+            # 종료 알림 (이미 DONE 처리된 것이라면 스킵)
+            if status == "RUNNING":
+                mentions = format_mentions_for_steel()
+                msg = f"⏰ **{name} 타이머 종료!**{mentions}"
+                await broadcast_alert(msg)
+                mark_timer_done(row_idx)
+            continue
+
+        # 남은 시간 기준 알림들
+        # 4시간(14400), 2시간(7200), 1시간(3600), 30분(1800)
+        # 이미 지난 스테이지는 건너뛰고,
+        # 재시작 후 처음 체크 시점에도 조건 만족하면 바로 울리도록 설계
+        def stage_allowed(prev: str, current: str) -> bool:
+            order = ["NONE", "4H", "2H", "1H", "30M", "DONE"]
+            try:
+                return order.index(prev) < order.index(current)
+            except ValueError:
+                # 이상한 값이면 그냥 통과시켜버림 (안전)
+                return True
+
+        # 4시간 전
+        if left_sec <= 4 * 3600 and left_sec > 2 * 3600 and stage_allowed(alert_stage, "4H"):
+            mentions = format_mentions_for_steel()
+            msg = f"⏳ **{name} 타이머 4시간 전입니다!**{mentions}"
+            await broadcast_alert(msg)
+            update_alert_stage(row_idx, "4H")
+            alert_stage = "4H"
+
+        # 2시간 전
+        if left_sec <= 2 * 3600 and left_sec > 1 * 3600 and stage_allowed(alert_stage, "2H"):
+            mentions = format_mentions_for_steel()
+            msg = f"⏳ **{name} 타이머 2시간 전입니다!**{mentions}"
+            await broadcast_alert(msg)
+            update_alert_stage(row_idx, "2H")
+            alert_stage = "2H"
+
+        # 1시간 전
+        if left_sec <= 1 * 3600 and left_sec > 30 * 60 and stage_allowed(alert_stage, "1H"):
+            mentions = format_mentions_for_steel()
+            msg = f"⏳ **{name} 타이머 1시간 전입니다!**{mentions}"
+            await broadcast_alert(msg)
+            update_alert_stage(row_idx, "1H")
+            alert_stage = "1H"
+
+        # 30분 전
+        if left_sec <= 30 * 60 and stage_allowed(alert_stage, "30M"):
+            mentions = format_mentions_for_steel()
+            msg = f"⏳ **{name} 타이머 30분 전입니다!**{mentions}"
+            await broadcast_alert(msg)
+            update_alert_stage(row_idx, "30M")
+            alert_stage = "30M"
 
 
-def format_remaining(remain_sec: float) -> str:
-    sec = int(remain_sec)
-    if sec < 0:
-        sec = 0
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h}시간 {m}분 {s}초"
-
-
-# --------------------------------
-# 명령어
-# --------------------------------
+# =========================
+#        명령어들
+# =========================
 
 @bot.command(name="강철")
-async def steel_timer(ctx, number: int):
+async def 강철(ctx: commands.Context, number: str):
     """
     !강철 X
-      - 행 있으면 남은 시간 표시
-      - 없거나 끝났으면 12시간 타이머 새로 시작
+    - 이미 타이머가 돌고 있으면 남은 시간 표시
+    - 없으면 새 12시간 타이머 시작
     """
-    name = f"강철{number}"
-    row = find_row(name)
+    key = f"강철{number}"
+    row = find_row(key)
 
-    # 행이 없으면 새로 생성
-    if row is None:
-        ws.append_row([name, "", "", "", "0"])
-        row = find_row(name)
+    if not row:
+        await ctx.send("시트에서 해당 강철 번호를 찾을 수 없습니다.")
+        return
 
-    start_value = ws.cell(row, 2).value
+    timer = get_timer_data(row)
 
-    if start_value:
-        start_dt = parse_start_time(start_value)
-        if start_dt:
-            elapsed = (datetime.now() - start_dt).total_seconds()
-            if elapsed < DURATION_SECONDS:
-                remain = DURATION_SECONDS - elapsed
-                await ctx.send(
-                    f"⏳ **[{name}] 남은 시간:** {format_remaining(remain)}"
-                )
+    # 이미 타이머가 있는 경우: 남은 시간 안내
+    if timer:
+        name, start_dt, duration, status, alert_stage = timer
+        if status == "RUNNING":
+            end_time = start_dt + timedelta(seconds=duration)
+            left = end_time - datetime.utcnow()
+            sec = int(left.total_seconds())
+            if sec <= 0:
+                await ctx.send(f"🔔 {key} 타이머는 이미 종료되었습니다.")
                 return
+            h, m = divmod(sec // 60, 60)
+            s = sec % 60
+            await ctx.send(f"🕒 **{key} 남은 시간:** {h}시간 {m}분 {s}초")
+            return
 
-    # 새 12시간 타이머 시작
-    ws.update_cell(row, 2, datetime.now().isoformat())  # 시작시간
-    ws.update_cell(row, 3, DURATION_SECONDS)            # duration
-    ws.update_cell(row, 5, "0")                         # 알람 단계 초기화
-
-    await ctx.send(f"🔔 **[{name}] 타이머 시작 (12시간)**")
+    # 새 타이머 시작
+    set_timer(row, duration_sec=12 * 60 * 60)
+    await ctx.send(f"⏳ **{key} 타이머를 새로 시작했습니다! (12시간)**")
 
 
 @bot.command(name="완료")
-async def finish_timer(ctx, mat: str, number: int):
+async def 완료(ctx: commands.Context, kind: str, number: str):
     """
     !완료 강철 X
-      - 강철X 행 자체를 시트에서 삭제
+    - 해당 강철 X 타이머를 강제 종료(DONE) 처리
     """
-    if mat != "강철":
-        await ctx.send("현재는 **강철만 지원**합니다.")
+    if kind != "강철":
+        await ctx.send("지금은 '강철' 타이머만 완료 처리할 수 있습니다. 예: `!완료 강철 1`")
         return
 
-    name = f"강철{number}"
-    row = find_row(name)
-
-    if row is None:
-        await ctx.send(f"❌ [{name}] 항목이 없습니다.")
+    key = f"강철{number}"
+    row = find_row(key)
+    if not row:
+        await ctx.send("시트에서 해당 강철 번호를 찾을 수 없습니다.")
         return
 
-    ws.delete_rows(row)
-    await ctx.send(f"🧹 **[{name}] 타이머 삭제 완료.**")
+    timer = get_timer_data(row)
+    if not timer:
+        await ctx.send(f"{key} 타이머는 시작된 기록이 없습니다.")
+        return
+
+    name, start_dt, duration, status, alert_stage = timer
+    if status != "RUNNING":
+        await ctx.send(f"{key} 타이머는 이미 완료된 상태입니다.")
+        return
+
+    mark_timer_done(row)
+    await ctx.send(f"✅ **{key} 타이머를 수동으로 완료 처리했습니다.**")
 
 
 @bot.command(name="강철대상")
-async def add_steel_target(ctx, *members):
+async def 강철대상(ctx: commands.Context):
     """
-    !강철대상 @유저1 @유저2 ...
-      - 호출대상자 시트 2행(B2~)에 대상자 추가
+    !강철대상 @사람1 @사람2 ...
+    - 호출대상자 시트의 강철 대상자 목록(B2~)에 추가
     """
-    if not members:
-        await ctx.send("추가할 멤버를 멘션해주세요.\n예: `!강철대상 @유저`")
+    if not ctx.message.mentions:
+        await ctx.send("추가할 대상을 멘션해주세요. 예: `!강철대상 @사용자`")
         return
 
-    row = mention_ws.row_values(2)[1:]  # B2~
-    updated = list(row)
+    # 2행 전체 읽기
+    row_vals = mentions_sheet.row_values(2)
+    # 최소 2칸 이상 확보
+    while len(row_vals) < 2:
+        row_vals.append("")
+
+    existing_ids = set(v.strip() for v in row_vals[1:] if v.strip())
 
     added = []
-    for m in members:
-        if m not in updated:
-            updated.append(m)
-            added.append(m)
-
-    if updated:
-        end_col_letter = chr(65 + len(updated))  # A=65
-        mention_ws.update(f"B2:{end_col_letter}2", [updated])
+    for member in ctx.message.mentions:
+        uid_str = str(member.id)
+        if uid_str not in existing_ids:
+            # 첫 빈 칸 찾기 (B열부터)
+            # row_vals[0] = A2, row_vals[1] = B2 ...
+            try:
+                first_empty_idx = next(
+                    i for i, v in enumerate(row_vals[1:], start=2) if not v.strip()
+                )
+            except StopIteration:
+                # 빈 칸이 없으면 맨 끝 다음 칸에 추가
+                first_empty_idx = len(row_vals) + 1
+            mentions_sheet.update_cell(2, first_empty_idx, uid_str)
+            existing_ids.add(uid_str)
+            added.append(member.mention)
 
     if added:
-        await ctx.send(f"✅ 추가됨: {', '.join(added)}")
+        await ctx.send(f"강철 알림 대상에 추가: {', '.join(added)}")
     else:
-        await ctx.send("추가된 대상이 없습니다. (이미 모두 포함되어 있음)")
+        await ctx.send("추가할 신규 대상이 없습니다.")
 
 
 @bot.command(name="강철대상제외")
-async def remove_steel_target(ctx, *members):
+async def 강철대상제외(ctx: commands.Context):
     """
-    !강철대상제외 @유저1 @유저2 ...
-      - 호출대상자 시트 2행(B2~)에서 대상자 제거
+    !강철대상제외 @사람1 @사람2 ...
+    - 호출대상자 시트의 강철 대상자 목록에서 제거
     """
-    if not members:
-        await ctx.send("제거할 멤버를 멘션해주세요.\n예: `!강철대상제외 @유저`")
+    if not ctx.message.mentions:
+        await ctx.send("제외할 대상을 멘션해주세요. 예: `!강철대상제외 @사용자`")
         return
 
-    row = mention_ws.row_values(2)[1:]
-    updated = [x for x in row if x not in members]
+    row_vals = mentions_sheet.row_values(2)
+    while len(row_vals) < 2:
+        row_vals.append("")
 
-    if updated:
-        end_col_letter = chr(65 + len(updated))
-        mention_ws.update(f"B2:{end_col_letter}2", [updated])
-    else:
-        # 모두 제거되면 B2~Z2 빈칸으로 초기화
-        mention_ws.update("B2:Z2", [[""] * 25])
-
-    await ctx.send(f"🗑 제거됨: {', '.join(members)}")
-
-
-# --------------------------------
-# 타이머 체크 루프 (150초마다 1번)
-# --------------------------------
-
-@tasks.loop(seconds=150)
-async def timer_check():
-    """
-    모든 강철 타이머를 150초(2.5분)마다 체크해서
-    4시간 / 2시간 / 1시간 / 30분 / 종료 알람을 보냄.
-    """
-    if ALERT_CHANNEL_ID is None:
-        print("ERROR: ALERT_CHANNEL_ID가 설정되어 있지 않아 알림 채널을 찾을 수 없습니다.")
-        return
-
-    channel = bot.get_channel(ALERT_CHANNEL_ID)
-    if channel is None:
-        print(f"ERROR: Alert channel (ID={ALERT_CHANNEL_ID}) not found.")
-        return
-
-    try:
-        all_rows = ws.get_all_values()
-    except Exception as e:
-        print(f"ERROR: failed to read sheet: {e}")
-        return
-
-    for i, row in enumerate(all_rows[1:], start=2):
-        # 최소한 이름/시작시간 정도는 있어야 의미 있음
-        if not row or len(row) < 2:
-            continue
-
-        name = row[0]
-        start_val = row[1]
-
-        if not start_val:
-            continue
-
-        # 알람 단계(stage) 읽기 (이상한 값이면 0)
-        stage = 0
-        if len(row) >= 5:
-            raw = (row[4] or "").strip().upper()
-            if raw not in ["", "NONE", "NULL", "N/A"]:
-                try:
-                    stage = int(raw)
-                except ValueError:
-                    stage = 0
-
-        start_dt = parse_start_time(start_val)
-        if not start_dt:
-            # 시간을 못 읽으면 이 행은 건너뜀
-            continue
-
-        elapsed = (datetime.now() - start_dt).total_seconds()
-        remain = DURATION_SECONDS - elapsed
-
-        mentions = get_steel_mentions()
-        mention_text = " ".join(mentions) if mentions else ""
-
-        # 0 이하 -> 종료 알람
-        if remain <= 0 and stage < 5:
-            await channel.send(
-                f"{mention_text}\n"
-                f"⏰ **[{name}] 타이머 종료!**"
-            )
-            ws.update_cell(i, 5, "5")
-            continue
-
-        # 남은 시간에 따른 알람들 (4h / 2h / 1h / 30m)
-        alerts = [
-            (4 * 3600, 1, "4시간 남았습니다!"),
-            (2 * 3600, 2, "2시간 남았습니다!"),
-            (1 * 3600, 3, "1시간 남았습니다!"),
-            (30 * 60,  4, "30분 남았습니다!"),
-        ]
-
-        for threshold, new_stage, msg in alerts:
-            # remain이 threshold 이하로 떨어지고, 아직 해당 단계 이전이면 울림
-            if remain <= threshold and stage < new_stage:
-                await channel.send(
-                    f"{mention_text}\n"
-                    f"🔔 **[{name}] {msg}**"
-                )
-                ws.update_cell(i, 5, str(new_stage))
+    removed = []
+    for member in ctx.message.mentions:
+        uid_str = str(member.id)
+        # B열부터 검사
+        for col_idx in range(2, len(row_vals) + 1):
+            cell_val = mentions_sheet.cell(2, col_idx).value or ""
+            if cell_val.strip() == uid_str:
+                mentions_sheet.update_cell(2, col_idx, "")
+                removed.append(member.mention)
                 break
 
+    if removed:
+        await ctx.send(f"강철 알림 대상에서 제외: {', '.join(removed)}")
+    else:
+        await ctx.send("제외할 대상이 목록에 없습니다.")
 
+
+# =========================
+#        봇 준비 이벤트
+# =========================
 @bot.event
 async def on_ready():
     print(f"Bot ready: {bot.user}")
-    if not timer_check.is_running():
-        timer_check.start()
+    if not timer_checker.is_running():
+        timer_checker.start()
 
 
-bot.run(DISCORD_TOKEN)
+# =========================
+#          실행
+# =========================
+bot.run(TOKEN)
