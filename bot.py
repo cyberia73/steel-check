@@ -91,7 +91,7 @@ def parse_datetime(dt_str: str) -> datetime | None:
 
 def find_row(keyword: str) -> int | None:
     """
-    시트 전체에서 keyword(예: '강철1')와 일치하는 셀을 찾고,
+    시트 전체에서 keyword(예: '강철 1')와 일치하는 셀을 찾고,
     그 셀이 속한 행 번호를 반환한다.
 
     - '강철1', '강철 1' 모두 허용 (공백 무시)
@@ -304,10 +304,14 @@ async def 강철(ctx: commands.Context, number: str):
     """
     !강철 X
 
-    - 시트에 '강철X' 행이 없으면:
+    - X는 '순수 숫자'만 허용 (예: 1, 2, 10)
+      → 예: `!강철 1` ✅
+      → `!강철1`, `!강철 1!`, `!강철 a` 등은 ❌
+
+    - 시트에 '강철 X' 행이 없으면:
         → 새 행을 만들고 12시간 타이머 시작
 
-    - 시트에 '강철X' 행이 있고,
+    - 시트에 '강철 X' 행이 있고,
         * 상태가 RUNNING이면
             → 남은 시간만 보여줌 (새로 안 만듦)
         * 상태가 DONE 이면
@@ -315,17 +319,32 @@ async def 강철(ctx: commands.Context, number: str):
         * 그 외(비어 있거나 이상한 값)이면
             → 새 12시간 타이머 시작
     """
-    key = f"강철{number}"
 
-    # 1) 먼저 기존 행을 찾는다
+    # 1) 숫자 형식 검증: 순수 숫자만 허용
+    if not number.isdigit():
+        await ctx.send("`!강철 숫자` 형식만 사용할 수 있습니다. 예: `!강철 1`")
+        return
+
+    # 01, 001 같은 것도 전부 1로 통일
+    n = int(number)
+    if n <= 0:
+        await ctx.send("강철 번호는 1 이상의 정수여야 합니다. 예: `!강철 1`")
+        return
+
+    number_str = str(n)
+
+    # 이제부터 키는 '강철 X' 형식으로 사용
+    key = f"강철 {number_str}"
+
+    # 2) 먼저 기존 행을 찾는다
     row = find_row(key)
 
-    # 2) 아예 행이 없으면: 맨 아래에 새로 만들고 타이머 시작
+    # 3) 아예 행이 없으면: 맨 아래에 새로 만들고 타이머 시작
     if not row:
         data = timer_sheet.get_all_values()
         row = len(data) + 1  # 맨 마지막 다음 줄
 
-        # A열에 이름만 먼저 써 둔다
+        # A열에 이름만 먼저 써 둔다 (강철 X)
         timer_sheet.update_cell(row, 1, key)
 
         # 새 타이머 시작
@@ -333,10 +352,10 @@ async def 강철(ctx: commands.Context, number: str):
         await ctx.send(f"⏳ **{key} 타이머가 시트에 새로 생성되고, 12시간 타이머를 시작했습니다.**")
         return
 
-    # 3) 행은 있는데, 거기에 저장된 타이머 정보 읽기
+    # 4) 행은 있는데, 거기에 저장된 타이머 정보 읽기
     timer = get_timer_data(row)
 
-    # 3-1) 정보가 아예 없거나(이상하게 비어있을 때)
+    # 4-1) 정보가 아예 없거나(이상하게 비어있을 때)
     if not timer:
         set_timer(row, duration_sec=12 * 60 * 60)
         await ctx.send(f"⏳ **{key} 타이머를 새로 시작했습니다! (12시간)**")
@@ -344,7 +363,7 @@ async def 강철(ctx: commands.Context, number: str):
 
     name, start_dt, duration, status, alert_stage = timer
 
-    # 3-2) RUNNING이면: 기존 남은 시간만 보여주기 (새로 안 만듦)
+    # 4-2) RUNNING이면: 기존 남은 시간만 보여주기 (새로 안 만듦)
     if status == "RUNNING":
         end_time = start_dt + timedelta(seconds=duration)
         left = end_time - datetime.utcnow()
@@ -357,7 +376,7 @@ async def 강철(ctx: commands.Context, number: str):
         await ctx.send(f"🕒 **{key} 남은 시간:** {h}시간 {m}분 {s}초")
         return
 
-    # 3-3) DONE이거나, RUNNING이 아닌 다른 상태면: 새로 12시간 타이머 시작
+    # 4-3) DONE이거나, RUNNING이 아닌 다른 상태면: 새로 12시간 타이머 시작
     #     (행은 새로 안 만들고, 기존 행 재사용)
     if status == "DONE" or status == "":
         set_timer(row, duration_sec=12 * 60 * 60)
@@ -374,12 +393,24 @@ async def 완료(ctx: commands.Context, kind: str, number: str):
     """
     !완료 강철 X
     - 해당 강철 X 타이머를 강제 종료(DONE) 처리
+    - X는 순수 숫자만 허용
     """
     if kind != "강철":
         await ctx.send("지금은 '강철' 타이머만 완료 처리할 수 있습니다. 예: `!완료 강철 1`")
         return
 
-    key = f"강철{number}"
+    if not number.isdigit():
+        await ctx.send("`!완료 강철 숫자` 형식만 사용할 수 있습니다. 예: `!완료 강철 1`")
+        return
+
+    n = int(number)
+    if n <= 0:
+        await ctx.send("강철 번호는 1 이상의 정수여야 합니다. 예: `!완료 강철 1`")
+        return
+
+    number_str = str(n)
+    key = f"강철 {number_str}"
+
     row = find_row(key)
     if not row:
         await ctx.send("시트에서 해당 강철 번호를 찾을 수 없습니다.")
